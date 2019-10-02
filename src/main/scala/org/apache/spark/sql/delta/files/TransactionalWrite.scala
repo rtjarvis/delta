@@ -21,7 +21,6 @@ import org.apache.spark.sql.delta.actions._
 import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.schema._
 import org.apache.hadoop.fs.Path
-
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
 import org.apache.spark.sql.execution._
@@ -110,14 +109,21 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
    * actions to append these files to the reservoir.
    */
   def writeFiles(
-      data: Dataset[_],
+      rawData: Dataset[_],
       writeOptions: Option[DeltaOptions],
       isOptimize: Boolean): Seq[AddFile] = {
     hasWritten = true
 
-    val spark = data.sparkSession
+    val spark = rawData.sparkSession
     val partitionSchema = metadata.partitionSchema
     val outputPath = deltaLog.dataPath
+
+    val repartitionWrite = spark.sparkContext.getLocalProperty("delta.repartition.write")
+    val data = if (repartitionWrite != null) {
+      rawData.repartition(repartitionWrite.toInt)
+    } else {
+      rawData
+    }
 
     val (queryExecution, output) = normalizeData(data, metadata.partitionColumns)
     val partitioningColumns =
