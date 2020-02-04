@@ -27,6 +27,8 @@ import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.datasources.FileFormatWriter
 import org.apache.spark.sql.types.{ArrayType, MapType, StructType}
 
+import scala.util.Try
+
 /**
  * Adds the ability to write files out as part of a transaction. Checks
  * are performed to ensure that the data being written matches either the
@@ -119,8 +121,11 @@ trait TransactionalWrite extends DeltaLogging { self: OptimisticTransactionImpl 
     val outputPath = deltaLog.dataPath
 
     val repartitionWrite = spark.sparkContext.getLocalProperty("delta.repartition.write")
-    val data = if (repartitionWrite != null) {
-      rawData.repartition(repartitionWrite.toInt)
+
+    val data = if (repartitionWrite != null &&  Try(repartitionWrite.toInt).isSuccess) {
+      rawData.coalesce(repartitionWrite.toInt)
+    } else if ( repartitionWrite != null &&  rawData.columns.contains(repartitionWrite) ) {
+      rawData.repartition(rawData.col(repartitionWrite))
     } else {
       rawData
     }
