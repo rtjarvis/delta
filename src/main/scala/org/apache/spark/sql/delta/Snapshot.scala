@@ -29,6 +29,8 @@ import org.apache.hadoop.fs.{FileSystem, Path}
 
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+import org.apache.spark.sql.catalyst.plans.logical.Union
+import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.expressions.UserDefinedFunction
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.StructType
@@ -53,7 +55,7 @@ class Snapshot(
     val path: Path,
     val version: Long,
     previousSnapshot: Option[Dataset[SingleAction]],
-    files: Seq[Path],
+    files: Seq[DeltaLogFileIndex],
     val minFileRetentionTimestamp: Long,
     val deltaLog: DeltaLog,
     val timestamp: Long,
@@ -73,7 +75,7 @@ class Snapshot(
   // Reconstruct the state by applying deltas in order to the checkpoint.
   // We partition by path as it is likely the bulk of the data is add/remove.
   // Non-path based actions will be collocated to a single partition.
-  private val stateReconstruction = {
+  private def stateReconstruction: Dataset[SingleAction] = {
     val implicits = spark.implicits
     import implicits._
 
@@ -112,19 +114,19 @@ class Snapshot(
   def redactedPath: String =
     Utils.redact(spark.sessionState.conf.stringRedactionPattern, path.toUri.toString)
 
-  private val cachedState =
+  private lazy val cachedState =
     cacheDS(stateReconstruction, s"Delta Table State #$version - $redactedPath")
 
   /** The current set of actions in this [[Snapshot]]. */
   def state: Dataset[SingleAction] = cachedState.getDS
 
-  // Force materialization of the cache and collect the basics to the driver for fast access.
-  // Here we need to bypass the ACL checks for SELECT anonymous function permissions.
-  val State(protocol, metadata, setTransactions, sizeInBytes, numOfFiles, numOfMetadata,
-      numOfProtocol, numOfRemoves, numOfSetTransactions) = {
-    val implicits = spark.implicits
-    import implicits._
-    state.select(
+  // Materialize the cache and collect the basics to the driver for fast access.
+  protected lazy val materializedState: State = {
+    // Here we need to bypass the ACL checks for SELECT anonymous function permissions.
+    {
+      val implicits = spark.implicits
+      import implicits._
+      state.select(
         coalesce(last($"protocol", ignoreNulls = true), defaultProtocol()) as "protocol",
         coalesce(last($"metaData", ignoreNulls = true), emptyMetadata()) as "metadata",
         collect_set($"txn") as "setTransactions",
@@ -135,8 +137,19 @@ class Snapshot(
         count($"protocol") as "numOfProtocol",
         count($"remove") as "numOfRemoves",
         count($"txn") as "numOfSetTransactions")
-      .as[State](stateEncoder)}
-      .first
+        .as[State](stateEncoder)
+    }.first()
+  }
+
+  def protocol: Protocol = materializedState.protocol
+  def metadata: Metadata = materializedState.metadata
+  def setTransactions: Seq[SetTransaction] = materializedState.setTransactions
+  def sizeInBytes: Long = materializedState.sizeInBytes
+  def numOfFiles: Long = materializedState.numOfFiles
+  def numOfMetadata: Long = materializedState.numOfMetadata
+  def numOfProtocol: Long = materializedState.numOfProtocol
+  def numOfRemoves: Long = materializedState.numOfRemoves
+  def numOfSetTransactions: Long = materializedState.numOfSetTransactions
 
   deltaLog.protocolRead(protocol)
 
@@ -168,20 +181,31 @@ class Snapshot(
   val numIndexedCols: Int = DeltaConfigs.DATA_SKIPPING_NUM_INDEXED_COLS.fromMetaData(metadata)
 
   /**
-   * Load the transaction logs from paths. The files here may have different file formats and the
-   * file format can be extracted from the file extensions.
-   *
-   * Here we are reading the transaction log, and we need to bypass the ACL checks
-   * for SELECT any file permissions.
+   * Load the transaction logs from file indices. The files here may have different file formats
+   * and the file format can be extracted from the file extensions.
    */
-  private def load(paths: Seq[Path]): Dataset[SingleAction] = {
-    val pathAndFormats = paths.map(_.toString).map(path => path -> path.split("\\.").last)
-    pathAndFormats.groupBy(_._2).map { case (format, paths) =>
-      spark.read.format(format).schema(logSchema).load(paths.map(_._1): _*).as[SingleAction]
-    }.reduceOption(_.union(_)).getOrElse(emptyActions)
+  private def load(
+      files: Seq[DeltaLogFileIndex]): Dataset[SingleAction] = {
+    val relations = files.map { index: DeltaLogFileIndex =>
+      val fsRelation = HadoopFsRelation(
+        index,
+        index.partitionSchema,
+        logSchema,
+        None,
+        index.format,
+        Map.empty[String, String])(spark)
+      LogicalRelation(fsRelation)
+    }
+    if (relations.length == 1) {
+      Dataset[SingleAction](spark, relations.head)
+    } else if (relations.nonEmpty) {
+      Dataset[SingleAction](spark, Union(relations))
+    } else {
+      emptyActions
+    }
   }
 
-  private def emptyActions =
+  protected def emptyActions =
     spark.createDataFrame(spark.sparkContext.emptyRDD[Row], logSchema).as[SingleAction]
 }
 
@@ -218,7 +242,7 @@ object Snapshot extends DeltaLogging {
     })
   }
 
-  private case class State(
+  private[delta] case class State(
       protocol: Protocol,
       metadata: Metadata,
       setTransactions: Seq[SetTransaction],
@@ -251,4 +275,9 @@ class InitialSnapshot(
     val logPath: Path,
     override val deltaLog: DeltaLog,
     override val metadata: Metadata)
-  extends Snapshot(logPath, -1, None, Nil, -1, deltaLog, -1)
+  extends Snapshot(logPath, -1, None, Nil, -1, deltaLog, -1) {
+  override val state: Dataset[SingleAction] = emptyActions
+  override protected lazy val materializedState: Snapshot.State = {
+    Snapshot.State(Protocol(), metadata, Nil, 0L, 0L, 0L, 0L, 0L, 0L)
+  }
+}

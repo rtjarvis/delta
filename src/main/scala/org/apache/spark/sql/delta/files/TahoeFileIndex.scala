@@ -103,6 +103,12 @@ abstract class TahoeFileIndex(
       input
     }
   }
+
+  /**
+   * Returns the path of the base directory of the given file path (i.e. its parent directory with
+   * all the partition directories stripped off).
+   */
+  def getBasePath(filePath: Path): Option[Path] = Some(path)
 }
 
 
@@ -177,7 +183,7 @@ class TahoeBatchFileIndex(
       dataFilters: Seq[Expression],
       keepStats: Boolean = false): Seq[AddFile] = {
     DeltaLog.filterFileList(
-      snapshot.metadata.partitionColumns,
+      snapshot.metadata.partitionSchema,
       spark.createDataset(addFiles)(addFileEncoder).toDF(), partitionFilters)
       .as[AddFile](addFileEncoder)
       .collect()

@@ -72,8 +72,8 @@ case class DeltaSource(
   // Deprecated. Please use `ignoreDeletes` or `ignoreChanges` from now on.
   private val ignoreFileDeletion = {
     if (options.ignoreFileDeletion) {
-      val docPage = DeltaErrors.baseDocsPath(spark.sparkContext.getConf) +
-        "/delta/delta-streaming.html#ignoring-updates-and-deletes"
+      val docPage = DeltaErrors.generateDocsLink(spark.sparkContext.getConf,
+        "/delta/delta-streaming.html#ignoring-updates-and-deletes")
       logConsole(
         s"""WARNING: The 'ignoreFileDeletion' option is deprecated. Switch to using one of
            |'ignoreDeletes' or 'ignoreChanges'. Refer to $docPage for details.
@@ -94,7 +94,7 @@ case class DeltaSource(
   override val schema: StructType = deltaLog.snapshot.metadata.schema
 
   // This was checked before creating ReservoirSource
-  assert(!schema.isEmpty)
+  assert(schema.nonEmpty)
 
   private val tableId = deltaLog.snapshot.metadata.id
 

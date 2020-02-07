@@ -20,7 +20,9 @@ import shutil
 import os
 
 from pyspark.sql import SQLContext, functions, Row, SparkSession
+from pyspark import SparkContext, SparkConf
 
+from delta.tables import DeltaTable
 from delta.testing.utils import PySparkTestCase
 
 
@@ -60,6 +62,62 @@ class DeltaSqlTests(PySparkTestCase):
 
     def test_describe_history(self):
         assert(len(self.spark.sql("desc history delta.`%s`" % (self.temp_file)).collect()) > 0)
+
+    def test_generate(self):
+        # create a delta table
+        temp_path = tempfile.mkdtemp()
+        temp_file = os.path.join(temp_path, "delta_sql_test_table")
+        numFiles = 10
+        self.spark.range(100).repartition(numFiles).write.format("delta").save(temp_file)
+
+        # Generate the symlink format manifest
+        self.spark.sql("GENERATE SYMLINK_FORMAT_MANIFEST FOR TABLE delta.`{}`"
+                       .format(temp_file))
+
+        # check the contents of the manifest
+        # NOTE: this is not a correctness test, we are testing correctness in the scala suite
+        manifestPath = os.path.join(temp_file,
+                                    os.path.join("_symlink_format_manifest", "manifest"))
+        files = []
+        with open(manifestPath) as f:
+            files = f.readlines()
+
+        shutil.rmtree(temp_path)
+        # the number of files we write should equal the number of lines in the manifest
+        assert(len(files) == numFiles)
+
+    def test_convert(self):
+        df = self.spark.createDataFrame([('a', 1), ('b', 2), ('c', 3)], ["key", "value"])
+        temp_path2 = tempfile.mkdtemp()
+        temp_path3 = tempfile.mkdtemp()
+        temp_file2 = os.path.join(temp_path2, "delta_sql_test2")
+        temp_file3 = os.path.join(temp_path3, "delta_sql_test3")
+
+        df.write.format("parquet").save(temp_file2)
+        self.spark.sql("CONVERT TO DELTA parquet.`" + temp_file2 + "`")
+        self.__checkAnswer(
+            self.spark.read.format("delta").load(temp_file2),
+            [('a', 1), ('b', 2), ('c', 3)])
+
+        # test if convert to delta with partition columns work
+        df.write.partitionBy("value").format("parquet").save(temp_file3)
+        self.spark.sql("CONVERT TO DELTA parquet.`" + temp_file3 + "` PARTITIONED BY (value INT)")
+        self.__checkAnswer(
+            self.spark.read.format("delta").load(temp_file3),
+            [('a', 1), ('b', 2), ('c', 3)])
+
+        shutil.rmtree(temp_path2)
+        shutil.rmtree(temp_path3)
+
+    def __checkAnswer(self, df, expectedAnswer, schema=["key", "value"]):
+        if not expectedAnswer:
+            self.assertEqual(df.count(), 0)
+            return
+        expectedDF = self.spark.createDataFrame(expectedAnswer, schema)
+        self.assertEqual(df.count(), expectedDF.count())
+        self.assertEqual(len(df.columns), len(expectedDF.columns))
+        self.assertEqual([], df.subtract(expectedDF).take(1))
+        self.assertEqual([], expectedDF.subtract(df).take(1))
 
 
 if __name__ == "__main__":
